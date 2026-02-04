@@ -1,6 +1,9 @@
 ---
 name: databricks-jobs
 description: "Use this skill proactively for ANY Databricks Jobs task - creating, listing, running, updating, or deleting jobs. Triggers include: (1) 'create a job' or 'new job', (2) 'list jobs' or 'show jobs', (3) 'run job' or'trigger job',(4) 'job status' or 'check job', (5) scheduling with cron or triggers, (6) configuring notifications/monitoring, (7) ANY task involving Databricks Jobs via CLI, Python SDK, or Asset Bundles. ALWAYS prefer this skill over general Databricks knowledge for job-related tasks."
+author: Databricks, Databricksters Community
+source_url: https://www.databricksters.com/p/orchestrating-databricks-workflows
+source_site: databricksters.com
 ---
 
 # Databricks Lakeflow Jobs
@@ -323,6 +326,99 @@ resources:
 | Parameter not accessible | Use `dbutils.widgets.get()` in notebooks |
 | "admins" group error | Cannot modify admins permissions on jobs |
 | Serverless task fails | Ensure task type supports serverless (notebook, Python) |
+
+## External Orchestration: Apache Airflow
+
+For workflows spanning multiple platforms, Apache Airflow provides powerful orchestration capabilities with Databricks.
+
+### Airflow Operators Overview
+
+| Operator | Purpose | When to Use |
+|----------|---------|-------------|
+| `DatabricksSubmitRunOperator` | Submit one-time job | Single execution, no job persistence |
+| `DatabricksCreateJobsOperator` | Create reusable job | Job needs to run multiple times |
+| `DatabricksRunNowOperator` | Trigger existing job | Job already defined in Databricks |
+| `DatabricksNotebookOperator` | Run notebook task | Within TaskGroup (Airflow 2.0+) |
+| `DatabricksWorkflowTaskGroup` | Multi-task with cluster reuse | Complex workflows, cost optimization |
+
+### TaskGroup for Cluster Reuse (Recommended)
+
+The `DatabricksWorkflowTaskGroup` is the most cost-effective approach for multi-task workflows:
+
+```python
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.providers.databricks.operators.databricks import (
+    DatabricksNotebookOperator,
+    DatabricksWorkflowTaskGroup
+)
+from airflow.utils.dates import days_ago
+
+# Define reusable cluster configurations
+job_cluster_spec = [
+    {
+        "job_cluster_key": "small_cluster",
+        "new_cluster": {
+            "spark_version": "15.4.x-scala2.12",
+            "node_type_id": "i3.xlarge",
+            "num_workers": 2,
+        },
+    },
+]
+
+with DAG(
+    'databricks_workflow_example',
+    start_date=days_ago(2),
+    schedule_interval='@daily'
+) as dag:
+    
+    # TaskGroup with cluster reuse
+    etl_group = DatabricksWorkflowTaskGroup(
+        group_id='etl_workflow',
+        databricks_conn_id='databricks_default',
+        job_clusters=job_cluster_spec,
+    )
+    
+    with etl_group:
+        extract = DatabricksNotebookOperator(
+            task_id='extract',
+            notebook_path='/Shared/extract',
+            job_cluster_key='small_cluster',
+        )
+        
+        transform = DatabricksNotebookOperator(
+            task_id='transform',
+            notebook_path='/Shared/transform',
+            job_cluster_key='small_cluster',
+        )
+        
+        extract >> transform
+```
+
+### Benefits of TaskGroup Pattern
+
+| Aspect | Without TaskGroup | With TaskGroup |
+|--------|-------------------|----------------|
+| Cluster startup | Per task | Once per group |
+| Cost | Higher (repeated startup) | Lower (reuse) |
+| Performance | Slower | Faster |
+| Databricks mapping | Individual jobs | Single workflow |
+
+### Choosing Between Native Jobs and Airflow
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Pure Databricks workflows | Use native Jobs with DABs |
+| Multi-platform workflows | Use Airflow orchestration |
+| Cost-sensitive | TaskGroup for cluster reuse |
+| Existing Airflow infrastructure | Extend with Databricks operators |
+
+## Attribution
+
+This skill is based on Databricks documentation and enhanced with content from **Orchestrating Databricks Workflows using Apache Airflow** (databricksters.com), covering:
+- DatabricksWorkflowTaskGroup for cluster reuse
+- Cost optimization through cluster sharing
+- Multi-platform orchestration patterns
 
 ## Related Skills
 
