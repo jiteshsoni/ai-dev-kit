@@ -1,6 +1,9 @@
 ---
 name: spark-declarative-pipelines
 description: "Creates, configures, and updates Databricks Lakeflow Spark Declarative Pipelines (SDP/LDP) using serverless compute. Handles streaming tables, materialized views, CDC, SCD Type 2, and Auto Loader ingestion patterns. Use when building data pipelines, working with Delta Live Tables, ingesting streaming data, implementing change data capture, or when the user mentions SDP, LDP, DLT, Lakeflow pipelines, streaming tables, or bronze/silver/gold medallion architectures."
+author: Databricks, Artem Chebotko
+source_url: https://www.databricksters.com/p/mastering-stream-static-joins-in
+source_site: databricksters.com
 ---
 
 # Lakeflow Spark Declarative Pipelines (SDP)
@@ -422,6 +425,124 @@ def enriched_orders():
 
 ---
 
+## Stream-Static Joins for Real-Time Enrichment
+
+Stream-static joins enable real-time data enrichment by joining streaming data with slowly-changing reference data. This pattern is essential for production-grade streaming pipelines.
+
+### Why Stream-Static Joins?
+
+| Benefit | Description |
+|---------|-------------|
+| **Stateless** | No checkpoint state required |
+| **Low latency** | Immediate processing without buffering |
+| **Memory efficient** | Only current batch held in memory |
+| **Auto-refresh** | Static side automatically picks up updates |
+
+### Basic Pattern
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
+
+@dp.table(name="enriched_events", type="streaming")
+def enriched_events():
+    # Streaming source
+    events = (
+        spark.readStream
+        .format("delta")
+        .table("bronze_events")
+    )
+    
+    # Static dimension table (automatically refreshed)
+    customers = spark.read.table("dim_customers")
+    
+    # Stream-static join
+    return (
+        events
+        .join(customers, "customer_id", "left")
+        .select(
+            events["*"],
+            customers.customer_segment,
+            customers.lifetime_value
+        )
+    )
+```
+
+### Multiple Dimension Enrichment
+
+Chain multiple stream-static joins for complex enrichment:
+
+```python
+@dp.table(name="fully_enriched_events", type="streaming")
+def fully_enriched_events():
+    # Streaming source
+    events = spark.readStream.table("bronze_events")
+    
+    # Multiple dimension lookups
+    customers = spark.read.table("dim_customers")
+    products = spark.read.table("dim_products")
+    locations = spark.read.table("dim_locations")
+    
+    # Chain joins
+    enriched = (
+        events
+        .join(customers, "customer_id", "left")
+        .join(products, "product_id", "left")
+        .join(locations, "location_id", "left")
+    )
+    
+    return enriched
+```
+
+### Conditional Enrichment
+
+Use conditional logic for selective enrichment:
+
+```python
+@dp.table(name="conditionally_enriched", type="streaming")
+def conditionally_enriched():
+    events = spark.readStream.table("bronze_events")
+    premium_customers = spark.read.table("dim_premium_customers")
+    
+    # Only enrich premium customers
+    return events.join(
+        premium_customers,
+        F.when(
+            F.col("customer_tier") == "premium",
+            events["customer_id"] == premium_customers["customer_id"]
+        ).otherwise(F.lit(False)),
+        "left"
+    )
+```
+
+### Best Practices
+
+1. **Broadcast small dimensions** for optimal performance:
+   ```python
+   from pyspark.sql.functions import broadcast
+   
+   small_dim = broadcast(spark.read.table("small_dimension"))
+   ```
+
+2. **Monitor static table freshness**:
+   ```python
+   # Check when dimension was last updated
+   spark.sql("DESCRIBE HISTORY dim_customers").select("timestamp").limit(1)
+   ```
+
+3. **Use for enrichment, not filtering** - Stream-static joins work best for adding context, not for filtering streaming data
+
+### When to Use vs. Stream-Stream Joins
+
+| Scenario | Join Type |
+|----------|-----------|
+| Reference data changes slowly | Stream-static |
+| Both sides are streaming | Stream-stream |
+| Need historical context | Stream-stream with watermark |
+| Simple enrichment | Stream-static |
+
+---
+
 ## Common Issues
 
 | Issue | Solution |
@@ -472,3 +593,12 @@ For advanced configuration options (development mode, continuous pipelines, cust
 | **Sinks** | Python only, streaming only, append flows only |
 
 **Default to serverless** unless user explicitly requires R, RDD APIs, or JAR libraries.
+
+---
+
+## Attribution
+
+This skill is based on Databricks documentation and enhanced with content from **A Deep Dive into Spark Stream Static Joins** by Artem Chebotko (databricksters.com), covering:
+- Stream-static join patterns for data enrichment
+- Production IoT pipeline examples
+- Best practices for low-latency streaming
