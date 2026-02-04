@@ -1,6 +1,9 @@
 ---
 name: databricks-genie
-description: "Create and query Databricks Genie Spaces for natural language SQL exploration. Use when building Genie Spaces or asking questions via the Genie Conversation API."
+description: "Create and query Databricks Genie Spaces for natural language SQL exploration. Use when building Genie Spaces or asking questions via the Genie Conversation API. Includes Slack integration patterns."
+author: Databricks, Artem Chebotko, Veena Ramesh
+source_url: https://www.databricksters.com/p/integrate-slack-with-genie-natively
+source_site: databricksters.com
 ---
 
 # Databricks Genie
@@ -119,3 +122,117 @@ Use these skills in sequence:
 | **No warehouse available** | Create a SQL warehouse or provide `warehouse_id` explicitly |
 | **Poor query generation** | Add instructions and sample questions that reference actual column names |
 | **Slow queries** | Ensure warehouse is running; use OPTIMIZE on tables |
+
+## Slack Integration
+
+Integrate Genie with Slack to enable natural language data queries directly from team chat.
+
+### Architecture
+
+```
+User in Slack → Databricks App → Genie API → SQL Warehouse → Results in Slack
+```
+
+### Quick Setup
+
+1. **Create Slack App**:
+   - Go to [Slack API Apps](https://api.slack.com/apps)
+   - Create New App → From scratch
+   - Enable Socket Mode
+   - Add bot scopes: `app_mentions:read`, `chat:write`, `im:history`
+
+2. **Create Databricks App**:
+   ```bash
+   databricks apps create genie-slack-bot
+   ```
+
+3. **Grant Permissions** to Service Principal:
+   - Genie Space: "Can Run" permission
+   - SQL Warehouse: "Can Use" permission
+   - Unity Catalog: Read access to tables
+
+### Implementation Example
+
+```python
+import os
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.genie import GenieAPI
+
+# Initialize
+app = App(token=os.environ["SLACK_BOT_TOKEN"])
+workspace_client = WorkspaceClient()
+genie_client = GenieAPI(workspace_client.api_client)
+
+GENIE_SPACE_ID = "your-space-id"
+
+@app.event("app_mention")
+def handle_mention(event, say):
+    """Handle when bot is mentioned."""
+    query = event.get("text", "").split(">", 1)[-1].strip()
+    
+    # Start Genie conversation
+    response = genie_client.start_conversation(
+        space_id=GENIE_SPACE_ID,
+        content=query
+    )
+    
+    # Poll for completion
+    result = poll_for_result(
+        GENIE_SPACE_ID, 
+        response.id, 
+        response.message_id
+    )
+    
+    # Send formatted response to Slack
+    say(text=format_result(result), thread_ts=event.get("ts"))
+
+def poll_for_result(space_id, conversation_id, message_id, max_attempts=30):
+    """Poll Genie for query completion."""
+    import time
+    
+    for _ in range(max_attempts):
+        response = genie_client.get_message(
+            space_id=space_id,
+            conversation_id=conversation_id,
+            message_id=message_id
+        )
+        
+        if response.status == "COMPLETED":
+            return response
+        elif response.status == "FAILED":
+            raise Exception("Query failed")
+        
+        time.sleep(1)
+    
+    raise TimeoutError("Response timeout")
+
+def format_result(response):
+    """Format Genie response for Slack."""
+    parts = []
+    if response.text_content:
+        parts.append(response.text_content)
+    if response.sql_query:
+        parts.append(f"```sql\n{response.sql_query}\n```")
+    return "\n\n".join(parts)
+
+# Start the app
+if __name__ == "__main__":
+    handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
+    handler.start()
+```
+
+### Features
+
+- **Direct Messages**: Users can DM the bot with natural language queries
+- **Channel Mentions**: `@GenieBot show me sales data`
+- **Threaded Conversations**: Follow-up questions maintain context
+- **Feedback Collection**: Users can rate Genie responses
+
+## Attribution
+
+This skill includes content from:
+- **Databricks Documentation** - Core Genie functionality
+- **Artem Chebotko** - Slack integration with Genie (databricksters.com)
+- **Veena Ramesh** - Advanced conversational patterns
