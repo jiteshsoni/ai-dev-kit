@@ -1,289 +1,272 @@
 ---
-name: "spark-structured-streaming-expert-pack"
-description: "Comprehensive expert guide to Spark Structured Streaming covering checkpointing, idempotency, joins, aggregations, RTM, and production patterns."
-tags: ["spark-streaming", "expert", "reference", "production"]
+name: spark-structured-streaming
+description: Comprehensive guide to Spark Structured Streaming for production workloads. Use when building streaming pipelines, implementing real-time data processing, handling stateful operations, or optimizing streaming performance.
 ---
 
-# Spark Structured Streaming Expert Pack
+# Spark Structured Streaming
 
-## Overview
+Build production-ready streaming pipelines with Spark Structured Streaming. This skill provides an overview and navigation to detailed patterns and best practices.
 
-This expert pack consolidates deep knowledge on Spark Structured Streaming for production workloads.
-
-## Core Concepts
-
-### Checkpointing and Exactly-Once Semantics
+## Quick Start
 
 ```python
-# Checkpoint folder structure:
-# ├── metadata/      # Query ID
-# ├── offsets/       # Intent (what to process)
-# ├── commits/       # Confirmation (what completed)
-# ├── sources/       # Source metadata
-# └── state/         # Stateful operations
+from pyspark.sql.functions import col, from_json
 
-# Exactly-once achieved via:
-# 1. Checkpoint tracks progress
-# 2. Delta idempotent writes (queryId + epochId)
-# 3. Offset semantics (inclusive start, exclusive end)
-```
-
-### Offset Semantics
-
-```python
-# Offset file:
-{
-  "startOffset": {"topic": {"0": 100}},  # Inclusive
-  "endOffset": {"topic": {"0": 200}}     # Exclusive
-}
-# Processes: 100, 101, ..., 199
-# Does NOT process: 200
-# Next batch starts at: 200
-```
-
-## Stream Processing Patterns
-
-### Pattern 1: Spark to Delta Streaming
-
-```python
-(spark
+# Basic Kafka to Delta streaming
+df = (spark
     .readStream
     .format("kafka")
+    .option("kafka.bootstrap.servers", "broker:9092")
     .option("subscribe", "topic")
     .option("startingOffsets", "earliest")
     .load()
-    .writeStream
-    .format("delta")
-    .option("checkpointLocation", "/checkpoints/bronze")
-    .trigger(availableNow=True)  # Or processingTime
-    .start("/delta/bronze_table")
+    .select(from_json(col("value").cast("string"), schema).alias("data"))
+    .select("data.*")
 )
+
+df.writeStream \
+    .format("delta") \
+    .outputMode("append") \
+    .option("checkpointLocation", "/Volumes/catalog/checkpoints/stream") \
+    .trigger(processingTime="30 seconds") \
+    .start("/delta/target_table")
 ```
 
-### Pattern 2: Checkpointing Best Practices
+## Core Concepts
+
+### Streaming = Incremental Processing
+
+Streaming doesn't mean continuous - it means incremental processing:
 
 ```python
-def get_checkpoint_location(table_name):
-    """Checkpoint tied to TARGET, not source"""
-    return f"/Volumes/catalog/checkpoints/{table_name}"
+# Continuous (runs forever)
+.trigger(processingTime="30 seconds")
 
-# Why target-tied? Checkpoint already contains source info.
-# Benefits: Systematic organization, easy backup/restore
+# Scheduled (processes backlog then stops)
+.trigger(availableNow=True)  # Schedule via Jobs
+
+# Both use the same streaming API
 ```
 
-### Pattern 3: Idempotency Configuration
+### Exactly-Once Semantics
+
+Achieved via checkpoint + Delta idempotent writes:
 
 ```python
-# For exactly-once in forEachBatch:
-(df
-    .write
-    .format("delta")
-    .option("txnVersion", batch_id)
-    .option("txnAppId", "my_stream_job")
-    .mode("append")
-    .saveAsTable("target")
-)
+# Checkpoint tracks progress
+.option("checkpointLocation", "/checkpoints/stream")
+
+# Delta handles deduplication
+.option("txnVersion", batch_id)
+.option("txnAppId", "stream_job")
 ```
 
-## Joins
+## End-to-End Patterns
 
 ### Stream-Stream Joins
 
-```python
-# Two streaming sources
-stream1 = spark.readStream.table("stream_a")
-stream2 = spark.readStream.table("stream_b")
+Join two streaming sources with event-time semantics:
 
-joined = (stream1
-    .join(stream2, 
-          expr("""
-            stream_a.key = stream_b.key AND
-            stream_a.ts >= stream_b.ts - interval 5 minutes AND
-            stream_a.ts <= stream_b.ts + interval 5 minutes
-          """),
-          "inner"
-    )
-    .withWatermark("ts", "10 minutes")
+```python
+# See: stream-stream-joins
+stream1.withWatermark("ts", "10 min").join(
+    stream2.withWatermark("ts", "10 min"),
+    join_condition,
+    "inner"
 )
 ```
 
-### Stream-Batch (Stream-Static) Joins
+### Stream-Static Joins
+
+Enrich streams with Delta dimension tables:
 
 ```python
-# Stream + Delta dimension table
-stream = spark.readStream.table("events")
-dim = spark.table("dimensions")  # Delta table
-
-# Left join recommended for production
-enriched = stream.join(dim, "key", "left")
-
-# Why Delta? Version checking happens per microbatch
-# Non-Delta formats: Read once at startup only
+# See: stream-static-joins
+stream.join(dim_table, "key", "left")  # Left join recommended
 ```
 
-## Aggregations and State Management
+### Kafka to Kafka
 
-### Watermarking
+Build low-latency Kafka-to-Kafka pipelines:
 
 ```python
-# Event-time processing with watermarks
-windowed = (df
-    .withWatermark("event_time", "10 minutes")  # Late data threshold
-    .groupBy(
-        window(col("event_time"), "5 minutes"),
-        col("user_id")
-    )
-    .agg(sum("amount"))
-)
-
-# State expires after watermark duration
-# Reduces state store size
+# See: kafka-to-kafka
+source_df.writeStream.format("kafka").option("topic", "output").start()
 ```
 
-### State Store Monitoring
+### Kafka to Delta
+
+Ingest Kafka into Delta Lake:
 
 ```python
-# Read state store directly
-state_df = (spark
-    .read
-    .format("statestore")
-    .load("/checkpoint/state")
-)
-
-# Check partition balance
-state_df.groupBy("partitionId").count().show()
-
-# State metadata
-spark.read.format("state-metadata").load("/checkpoint").show()
+# See: kafka-to-delta
+kafka_df.writeStream.format("delta").start("/delta/target")
 ```
 
-## Real-Time Mode (RTM)
+### Write to Multiple Tables
 
-### RTM vs Microbatch
+Fan out single stream to multiple sinks:
 
 ```python
-# Microbatch (default)
-.trigger(processingTime="1 second")
-# - Schedules every interval
-# - Higher latency (scheduling overhead)
+# See: write-multiple-tables
+def write_multiple(batch_df, batch_id):
+    batch_df.write.saveAsTable("table1")
+    batch_df.filter(...).write.saveAsTable("table2")
 
-# Real-Time Mode
-.trigger(realTime=True)
-# - Pre-allocated resources
-# - Sub-second latency
-# - Higher resource usage
+stream.writeStream.foreachBatch(write_multiple).start()
 ```
 
-### When to Use RTM
+### Merge into Multiple Tables
 
-| Latency | Mode |
-|---------|------|
-| < 800ms | RTM or Flink |
-| > 800ms | Microbatch (cost-effective) |
-
-## Advanced Patterns
-
-### Output Modes
+Parallel MERGE operations:
 
 ```python
-# Append: Only new rows (default for most sinks)
-.writeStream.outputMode("append")
-
-# Update: Changed rows only
-.writeStream.outputMode("update")
-
-# Complete: Entire result table (aggregations)
-.writeStream.outputMode("complete")
+# See: merge-multiple-tables-parallel
+# Enable Liquid Clustering + DV + RLC for conflict-free merges
 ```
 
-### Deduplication
+## Configuration and Management
+
+### Checkpoint Management
 
 ```python
-# Drop duplicates with watermark
-(df
-    .withWatermark("timestamp", "10 minutes")
-    .dropDuplicates(["user_id", "event_id"])
-)
-
-# State stores seen keys
-# Expires after watermark duration
+# See: checkpoint-best-practices
+def get_checkpoint_location(table_name):
+    return f"/Volumes/catalog/checkpoints/{table_name}"
 ```
 
-### Schema Evolution
+### Watermark Configuration
 
 ```python
-# Handle evolving schemas
-(df
-    .writeStream
-    .option("mergeSchema", "true")
-    .start("/delta/table")
-)
+# See: watermark-configuration
+.withWatermark("event_time", "10 minutes")  # Late data threshold
 ```
 
-### Backfill Pattern
+### State Store Management
 
 ```python
-# Backfill from specific offset
-(spark
-    .readStream
-    .format("kafka")
-    .option("startingOffsets", """{"topic": {"0": 1000}}""")
-    .load()
-    # ... rest of pipeline
-)
+# See: state-store-management
+# Enable RocksDB for large state stores
+spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+               "com.databricks.sql.streaming.state.RocksDBStateProvider")
 ```
 
-### Tuning and Triggers
+### Trigger Tuning
 
 ```python
-# Trigger options:
-.trigger(processingTime="30 seconds")  # Fixed interval
-.trigger(availableNow=True)            # Process all, then stop
-.trigger(realTime=True)                # Low latency
-# No trigger = continuous (legacy)
-
-# Guideline: SLA / 3
-# Example: 1 hour SLA → 20 minute trigger
+# See: trigger-tuning
+.trigger(processingTime="30 seconds")  # Continuous
+.trigger(availableNow=True)            # Scheduled
+.trigger(realTime=True)                # Sub-second latency
 ```
 
-### Observability
+## Performance Optimization
+
+### Partitioning Strategy
 
 ```python
-# Key metrics to monitor:
-# 1. Input Rate vs Processing Rate (processing > input)
-# 2. Max Offsets Behind Latest (should decrease)
-# 3. Batch Duration vs Trigger Interval
-# 4. State Store Size
+# See: partitioning-strategy
+# Time-based partitioning or Liquid Clustering
+.partitionBy("date")  # or CLUSTER BY (user_id)
+```
 
-# Programmatic access:
+### Merge Performance
+
+```python
+# See: merge-performance
+# Enable Liquid Clustering + DV + RLC
+ALTER TABLE target SET TBLPROPERTIES (
+    'delta.enableDeletionVectors' = true,
+    'delta.enableRowLevelConcurrency' = true,
+    'delta.liquid.clustering' = true
+);
+```
+
+### Cost Tuning
+
+```python
+# See: cost-tuning
+# Use scheduled streaming, multi-stream clusters, right-sizing
+```
+
+## Operations
+
+### Monitoring and Observability
+
+```python
+# See: monitoring-observability
+# Track input rate, processing rate, lag, batch duration
 for stream in spark.streams.active:
-    print(stream.status)
-    print(stream.lastProgress)
+    progress = stream.lastProgress
+    # Monitor key metrics
 ```
 
-### Recovery Procedures
+### Error Handling and Recovery
 
 ```python
-# Normal recovery (automatic):
-# - Spark checks offset vs commit on restart
-# - Reprocesses if commit missing
-# - Delta handles deduplication
+# See: error-handling-recovery
+# Dead letter queues, exception handling, checkpoint recovery
+def write_with_dlq(batch_df, batch_id):
+    try:
+        valid.write.saveAsTable("target")
+    except Exception as e:
+        invalid.write.saveAsTable("dlq")
+```
 
-# Manual recovery (lost checkpoint):
-# 1. Delete checkpoint folder
-# 2. Restart with startingOffsets=earliest
-# 3. Reprocesses all data (idempotent if Delta sink)
+### Backfill Patterns
+
+```python
+# See: backfill-patterns
+# Reprocess historical data or specific time ranges
+backfill_df = spark.read.format("kafka").option("startingOffsets", ...).load()
+```
+
+## Ingestion
+
+### Auto Loader Schema Drift
+
+```python
+# See: auto-loader-schema-drift
+.option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+.option("rescuedDataColumn", "_rescued_data")
+```
+
+### DLT vs Jobs
+
+```python
+# See: dlt-vs-jobs
+# Choose between Delta Live Tables and Databricks Jobs
+```
+
+## Governance
+
+### Unity Catalog Integration
+
+```python
+# See: unity-catalog-streaming
+# Unified access control, lineage tracking, audit logging
+checkpoint_path = "/Volumes/catalog/checkpoints/stream"
+df.writeStream.start("catalog.schema.table")
 ```
 
 ## Production Checklist
 
-- [ ] Checkpoint location is persistent (S3/ADLS, not DBFS)
+- [ ] Checkpoint location is persistent (UC volumes, not DBFS)
 - [ ] Unique checkpoint per stream
 - [ ] Target-tied checkpoint organization
 - [ ] Fixed-size cluster (no autoscaling for streaming)
 - [ ] Monitoring configured (input rate, lag, batch duration)
 - [ ] Alerting for falling behind
 - [ ] Recovery procedure documented
-- [ ] Exactly-once verified (forEachBatch uses txnVersion)
-- [ ] State size monitored (watermark configured)
+- [ ] Exactly-once verified (txnVersion/txnAppId)
+- [ ] Watermark configured for stateful operations
 - [ ] Left joins for stream-static (not inner)
+
+## Related Skills
+
+- `kafka-to-delta` - Kafka ingestion patterns
+- `stream-stream-joins` - Event correlation
+- `stream-static-joins` - Dimension enrichment
+- `checkpoint-best-practices` - Checkpoint management
+- `watermark-configuration` - Late data handling
+- `monitoring-observability` - Stream health monitoring
